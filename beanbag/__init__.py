@@ -73,9 +73,9 @@ __version__ = '1.0.1'
 
 import requests
 try:
-    from urlparse import urlparse, parse_qs
+    from urlparse import urlparse, parse_qs, urljoin
 except ImportError:
-    from urllib.parse import urlparse, parse_qs
+    from urllib.parse import urlparse, parse_qs, urljoin
 
 try:
     import json
@@ -265,7 +265,7 @@ class BeanBag(BeanBagPath):
         else:
             content_type, encode, decode = fmt
 
-        bbr = BeanBagRequest(session, base_url, ext=ext,
+        bbr = BeanBagMultiPageRequest(session, base_url, ext=ext,
                              content_type=content_type,
                              encode=encode, decode=decode)
 
@@ -275,7 +275,9 @@ class BeanBag(BeanBagPath):
 class BeanBagRequest(object):
 
     def __init__(self, session, base_url, ext, content_type, encode, decode):
-        self.base_url = base_url.rstrip("/") + "/"
+        if not base_url.endswith("/"):
+            base_url += "/" # required by urljoin to work correctly
+        self.url = urlparse(base_url)
         self.ext = ext
 
         self.content_type = content_type
@@ -288,9 +290,58 @@ class BeanBagRequest(object):
         self.session.headers["content-type"] = self.content_type
 
     def path2url(self, path):
-        return self.base_url + path + self.ext
+        return urljoin(self.url.geturl(), path) + self.ext
+
+    def url2path_ext(self, url):
+        """
+        @param url
+        returns path, params
+        """
+        parsed = urlparse(url)
+        return parsed.path.replace(self.url.path, "") + self.ext, \
+            parse_qs(parsed.query)
 
     def make_request(self, verb, path, params, body):
+        path = self.path2url(path)
+
+        if body is None:
+            ebody = None
+        else:
+            try:
+                ebody = self.encode(body)
+            except:
+                raise BeanBagException("Could not encode request body",
+                                       None, (body,))
+
+        r = self.session.request(verb, path, params=params, data=ebody)
+
+        if r.status_code < 200 or r.status_code >= 300:
+            raise BeanBagException("Bad response code: %d" % (r.status_code,),
+                                   r, (verb, path, params, ebody))
+
+        if not r.content:
+            return None
+
+        elif r.headers.get("content-type", self.content_type).split(";", 1)[0] == self.content_type:
+            try:
+                return self.decode(r)
+            except:
+                raise BeanBagException("Could not decode response", r, (verb, path, params,  ebody))
+
+        else:
+            raise BeanBagException("Bad content-type in response (Content-Type: %s)"
+                                   % (r.headers["content-type"],),
+                                   r, (verb, path, params, ebody))
+
+class BeanBagMultiPageRequest(BeanBagRequest):
+    @staticmethod
+    def is_multi_page_response(response):
+        if isinstance(response, dict):
+          if set([u'count', u'next', u'results', u'previous']).issubset(set(response.keys())):
+            return True
+        return False
+
+    def _make_request(self, verb, path, params, body):
         path = self.path2url(path)
 
         if body is None:
@@ -322,6 +373,23 @@ class BeanBagRequest(object):
                                    % (r.headers["content-type"],),
                                    r, (verb, path, params, ebody))
 
+    def make_request(self, verb, path, params, body):
+        result = self._make_request(verb, path, params, body)
+        if self.is_multi_page_response(result):
+            count = result['count']
+            multi_result = result['results']
+
+            while result['next']:
+                next_path, new_ext = self.url2path_ext(result['next'])
+                result = self._make_request(verb, next_path, new_ext, body)
+                multi_result.extend(result['results'])
+
+            if len(multi_result) != count:
+                # just pass all results and info from last call
+                raise BeanBagException("MultiPageRequest failed: got %d elements expected %s" % \
+                 (len(multi_result), count), result, (verb, path, params, body))
+            return multi_result
+        return result
 
 class BeanBagException(Exception):
     """Exception thrown when a BeanBag request fails.
